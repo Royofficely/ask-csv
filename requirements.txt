@@ -1,0 +1,11 @@
+flask
+langchain
+langchain-experimental
+langchain-openai
+python-dotenv
+gunicorn
+werkzeug
+pandas
+numpy
+tabulate
+psycopg2-binary
