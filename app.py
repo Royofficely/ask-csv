@@ -1,16 +1,39 @@
 from flask import Flask, request, jsonify
 import os
+import duckdb
 from werkzeug.utils import secure_filename
 from langchain_experimental.agents import create_csv_agent
 from langchain_openai import ChatOpenAI
-import psycopg2
 from functools import wraps
+from datetime import datetime
 
 app = Flask(__name__)
 
-DATABASE_URL = os.environ.get('DATABASE_URL')
 API_TOKEN = os.environ.get('API_TOKEN')
 OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4o')
+DATA_DIR = os.environ.get('DATA_DIR', '/data')
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, 'askcsv.duckdb')
+
+def get_db():
+    return duckdb.connect(DB_PATH)
+
+def init_db():
+    conn = get_db()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY,
+            filename TEXT NOT NULL,
+            filepath TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('CREATE SEQUENCE IF NOT EXISTS files_seq START 1')
+    conn.close()
+
+init_db()
 
 def require_token(f):
     @wraps(f)
@@ -23,30 +46,11 @@ def require_token(f):
         return f(*args, **kwargs)
     return decorated
 
-def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError('DATABASE_URL not configured')
-    return psycopg2.connect(DATABASE_URL)
-
-def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS files
-                  (id SERIAL PRIMARY KEY,
-                   file_id TEXT,
-                   file_data BYTEA,
-                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    cur.close()
-    conn.close()
-
 @app.route('/api/health', methods=['GET'])
 def health():
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT 1')
-        cur.close()
+        conn = get_db()
+        conn.execute('SELECT 1')
         conn.close()
         db_status = True
     except Exception:
@@ -72,17 +76,17 @@ def upload_file():
         return jsonify({'error': 'Only CSV files are supported'}), 400
 
     filename = secure_filename(file.filename)
-    file_data = file.read()
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        'INSERT INTO files (file_id, file_data) VALUES (%s, %s) RETURNING id',
-        (filename, psycopg2.Binary(file_data))
+    conn = get_db()
+    file_id = conn.execute("SELECT nextval('files_seq')").fetchone()[0]
+
+    filepath = os.path.join(DATA_DIR, f'{file_id}_{filename}')
+    file.save(filepath)
+
+    conn.execute(
+        'INSERT INTO files (id, filename, filepath) VALUES (?, ?, ?)',
+        [file_id, filename, filepath]
     )
-    file_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
     conn.close()
 
     return jsonify({
@@ -98,20 +102,14 @@ def query_files():
     if not data or 'query' not in data or 'file_ids' not in data:
         return jsonify({'error': 'Missing query or file_ids'}), 400
 
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db()
 
     file_paths = []
     for file_id in data['file_ids']:
-        cur.execute('SELECT file_data FROM files WHERE id = %s', (file_id,))
-        result = cur.fetchone()
-        if result:
-            temp_path = f'/tmp/csv_{file_id}.csv'
-            with open(temp_path, 'wb') as f:
-                f.write(result[0])
-            file_paths.append(temp_path)
+        result = conn.execute('SELECT filepath FROM files WHERE id = ?', [int(file_id)]).fetchone()
+        if result and os.path.exists(result[0]):
+            file_paths.append(result[0])
 
-    cur.close()
     conn.close()
 
     if not file_paths:
@@ -140,21 +138,12 @@ def query_files():
             'status': 'error',
             'message': str(e)
         }), 500
-    finally:
-        for path in file_paths:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
 
 @app.route('/files', methods=['GET'])
 @require_token
 def list_files():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id, file_id, created_at FROM files ORDER BY created_at DESC')
-    files = cur.fetchall()
-    cur.close()
+    conn = get_db()
+    files = conn.execute('SELECT id, filename, created_at FROM files ORDER BY created_at DESC').fetchall()
     conn.close()
 
     return jsonify({
@@ -167,20 +156,22 @@ def list_files():
 @app.route('/files/<file_id>', methods=['DELETE'])
 @require_token
 def delete_file(file_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('DELETE FROM files WHERE id = %s RETURNING id', (file_id,))
-    deleted = cur.fetchone()
-    conn.commit()
-    cur.close()
+    conn = get_db()
+    result = conn.execute('SELECT filepath FROM files WHERE id = ?', [int(file_id)]).fetchone()
+
+    if not result:
+        conn.close()
+        return jsonify({'error': 'File not found'}), 404
+
+    filepath = result[0]
+    conn.execute('DELETE FROM files WHERE id = ?', [int(file_id)])
     conn.close()
 
-    if not deleted:
-        return jsonify({'error': 'File not found'}), 404
+    if os.path.exists(filepath):
+        os.remove(filepath)
 
     return jsonify({'message': 'File deleted successfully'}), 200
 
 if __name__ == '__main__':
-    init_db()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true')

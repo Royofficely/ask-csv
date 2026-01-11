@@ -4,7 +4,6 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    libpq-dev \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
@@ -15,8 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY app.py .
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Create data directory and non-root user
+RUN mkdir -p /data && \
+    useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app /data
 USER appuser
 
 EXPOSE 5000

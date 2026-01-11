@@ -8,4 +8,4 @@ werkzeug
 pandas
 numpy
 tabulate
-psycopg2-binary
+duckdb
